@@ -687,12 +687,12 @@ void sortBeyondDotsFarFirst(BeyondDotDrawItem* items, size_t count) {
   }
 }
 
-void drawAircraft(unsigned long now_ms) {
+void drawAircraft() {
   initLabelMetrics();
 
   size_t n = 0;
   const services::adsb::Aircraft* planes =
-      services::adsb::aircraftList(now_ms, &n);
+      services::adsb::aircraftList(&n);
 
   AircraftDrawItem items[services::adsb::kMaxAircraft];
   BeyondDotDrawItem dots[services::adsb::kMaxAircraft];
@@ -1052,7 +1052,7 @@ void renderFrame(unsigned long now_ms) {
     const DrawScope scope(s_frame);
     drawSweep(now_ms);
     drawCornerTelemetry();
-    drawAircraft(now_ms);
+    drawAircraft();
   }
   s_frame.pushSprite(0, 0);
   tft.setTextDatum(textdatum_t::top_left);
@@ -1077,7 +1077,7 @@ void radarDisplayDraw() {
   drawStaticGrid(tft);
   drawSweep(now_ms);
   drawCornerTelemetry();
-  drawAircraft(now_ms);
+  drawAircraft();
   tft.setTextDatum(textdatum_t::top_left);
 }
 

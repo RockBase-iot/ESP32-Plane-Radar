@@ -265,8 +265,9 @@ size_t aircraftCount() {
   return count;
 }
 
-const Aircraft* aircraftList(unsigned long now_ms, size_t* count) {
+const Aircraft* aircraftList(size_t* count) {
   taskENTER_CRITICAL(&s_tracks_lock);
+  const unsigned long now_ms = millis();
   const size_t display_count = s_aircraft_count;
   for (size_t i = 0; i < display_count; ++i) {
     s_display[i] = s_tracks[i].aircraft;
