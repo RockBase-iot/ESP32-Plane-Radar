@@ -28,14 +28,20 @@ unsigned long g_wifi_down_since = 0;
 unsigned long g_last_reconnect_ms = 0;
 unsigned long g_last_adsb_fetch_ms = 0;
 unsigned long g_last_animation_refresh_ms = 0;
-#ifdef BOARD_NM_TV_154
-constexpr uint16_t kTouchPressedThreshold = 90;
-constexpr unsigned long kSquareStatusRefreshIntervalMs = 1000UL;
 portMUX_TYPE g_adsb_update_lock = portMUX_INITIALIZER_UNLOCKED;
 TaskHandle_t g_adsb_fetch_task = nullptr;
 volatile bool g_adsb_refresh_pending = false;
 volatile unsigned long g_background_adsb_update_ms = 0;
-unsigned long g_last_background_adsb_fetch_ms = 0;
+struct AdsbRequest {
+  bool enabled;
+  double lat;
+  double lon;
+  float radius_km;
+};
+AdsbRequest g_adsb_request = {};
+#ifdef BOARD_NM_TV_154
+constexpr uint16_t kTouchPressedThreshold = 90;
+constexpr unsigned long kSquareStatusRefreshIntervalMs = 1000UL;
 unsigned long g_last_square_status_refresh_ms = 0;
 bool g_clock_started = false;
 ui::nm_tv_154::TouchRangeState g_touch_range_state;
@@ -124,13 +130,24 @@ void pollNetwork() {
   handleNmTv154RangeTouch();
 }
 
-#ifdef BOARD_NM_TV_154
 void pollBackgroundNetwork() { taskYIELD(); }
 
+void updateAdsbRequest() {
+  const AdsbRequest request = {
+      g_radar_visible && WiFi.status() == WL_CONNECTED,
+      services::location::lat(), services::location::lon(),
+      ui::radar::fetchRadiusKm()};
+  taskENTER_CRITICAL(&g_adsb_update_lock);
+  g_adsb_request = request;
+  taskEXIT_CRITICAL(&g_adsb_update_lock);
+}
+
 void fetchAndRequestAircraft() {
-  const float fetch_km = ui::radar::fetchRadiusKm();
-  if (!services::adsb::fetchUpdate(services::location::lat(),
-                                   services::location::lon(), fetch_km)) {
+  taskENTER_CRITICAL(&g_adsb_update_lock);
+  const AdsbRequest request = g_adsb_request;
+  taskEXIT_CRITICAL(&g_adsb_update_lock);
+  if (!request.enabled || WiFi.status() != WL_CONNECTED ||
+      !services::adsb::fetchUpdate(request.lat, request.lon, request.radius_km)) {
     return;
   }
 
@@ -153,18 +170,10 @@ bool consumeBackgroundAdsbUpdate(unsigned long* update_ms) {
 
 void adsbFetchTask(void*) {
   for (;;) {
-    if (g_radar_visible && WiFi.status() == WL_CONNECTED) {
-      const unsigned long now_ms = millis();
-      if (now_ms - g_last_background_adsb_fetch_ms >=
-          config::kAdsbFetchIntervalMs) {
-        g_last_background_adsb_fetch_ms = now_ms;
-        fetchAndRequestAircraft();
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
+    fetchAndRequestAircraft();
+    vTaskDelay(pdMS_TO_TICKS(config::kAdsbFetchIntervalMs));
   }
 }
-#endif
 
 void handleBootButton() {
   bootButtonPollLongPress();
@@ -207,11 +216,7 @@ void setup() {
   services::location::init();
   services::time_settings::init();
   ui::radar::rangeInit();
-#ifdef BOARD_NM_TV_154
   services::adsb::setPollFn(pollBackgroundNetwork);
-#else
-  services::adsb::setPollFn(pollNetwork);
-#endif
 #ifdef BOARD_NM_TV_154
   Serial.printf("[touch] ready, raw=%u\n",
                 static_cast<unsigned>(touchRead(T9)));
@@ -220,12 +225,12 @@ void setup() {
   if (wifiSetupConnect()) {
     showRadarIfConnected();
   }
-#ifdef BOARD_NM_TV_154
-  if (xTaskCreatePinnedToCore(adsbFetchTask, "adsb-fetch", 8192, nullptr, 1,
+  updateAdsbRequest();
+  if (xTaskCreatePinnedToCore(adsbFetchTask, "adsb-fetch", 16384, nullptr, 1,
                               &g_adsb_fetch_task, 0) != pdPASS) {
     Serial.println("adsb: background task create failed");
+    services::adsb::setPollFn(pollNetwork);
   }
-#endif
 }
 
 void loop() {
@@ -259,33 +264,31 @@ void loop() {
     if (!g_radar_visible) {
       showRadarIfConnected();
     } else {
-#ifdef BOARD_NM_TV_154
+      const unsigned long now_ms = millis();
       unsigned long update_ms = 0;
-      if (consumeBackgroundAdsbUpdate(&update_ms)) {
+      if (g_adsb_fetch_task == nullptr &&
+          now_ms - g_last_adsb_fetch_ms >= config::kAdsbFetchIntervalMs) {
+        g_last_adsb_fetch_ms = now_ms;
+        fetchAndDrawAircraft();
+      } else if (consumeBackgroundAdsbUpdate(&update_ms)) {
         const unsigned long draw_started_ms = millis();
         ui::radarDisplayMarkDataUpdated(update_ms);
         ui::radarDisplayRefreshAircraft();
         g_last_animation_refresh_ms = draw_started_ms;
       } else {
         serviceRadarAnimation();
+#ifdef BOARD_NM_TV_154
         const unsigned long status_now_ms = millis();
         if (status_now_ms - g_last_square_status_refresh_ms >=
             kSquareStatusRefreshIntervalMs) {
           g_last_square_status_refresh_ms = status_now_ms;
           ui::radarDisplayRefreshStatus();
         }
-      }
-#else
-      const unsigned long now_ms = millis();
-      if (now_ms - g_last_adsb_fetch_ms >= config::kAdsbFetchIntervalMs) {
-        g_last_adsb_fetch_ms = now_ms;
-        fetchAndDrawAircraft();
-      } else {
-        serviceRadarAnimation();
-      }
 #endif
+      }
     }
   }
 
+  updateAdsbRequest();
   delay(10);
 }

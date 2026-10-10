@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace services::adsb {
 
@@ -11,6 +12,10 @@ struct Aircraft {
   float nose_deg;
   float track_deg;
   float gs_knots;
+  /** Age of the position fix at fetch time (ms), from the feed's seen_pos.
+   *  Added to the elapsed time when dead-reckoning so the drawn position
+   *  reflects the estimated current location, not the already-stale fix. */
+  uint32_t pos_age_ms;
   char callsign[9];
   char type[5];
   char alt[12];

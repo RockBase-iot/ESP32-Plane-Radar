@@ -12,6 +12,7 @@
 
 #include "config.h"
 #include "services/aircraft_motion.h"
+#include "services/http_body_framing.h"
 
 namespace services::adsb {
 
@@ -19,8 +20,8 @@ namespace {
 
 constexpr char kApiBase[] = "https://opendata.adsb.fi/api/v3/lat/";
 constexpr float kKmPerNm = 1.852f;
-constexpr int kConnectAttemptMs = 200;
-constexpr unsigned long kRequestTimeoutMs = 10000;
+constexpr int kConnectTimeoutMs = 5000;  // TLS handshake needs room
+constexpr unsigned long kRequestTimeoutMs = 6000;
 
 using motion::AircraftTrack;
 
@@ -70,60 +71,74 @@ void pollNetwork() {
 }
 
 int performGetWithPoll(HTTPClient& http) {
-  http.setConnectTimeout(kConnectAttemptMs);
-  const unsigned long deadline = millis() + kRequestTimeoutMs;
-  while (millis() < deadline) {
-    pollNetwork();
-    const int code = http.GET();
-    if (code > 0) {
-      return code;
-    }
-    if (code != HTTPC_ERROR_CONNECTION_REFUSED &&
-        code != HTTPC_ERROR_NOT_CONNECTED) {
-      return code;
-    }
-    delay(5);
-  }
-  return HTTPC_ERROR_READ_TIMEOUT;
+  http.setConnectTimeout(kConnectTimeoutMs);
+  pollNetwork();
+  return http.GET();
 }
 
-bool readResponseBodyWithPoll(HTTPClient& http, String& payload) {
-  WiFiClient* stream = http.getStreamPtr();
-  if (stream == nullptr) {
+/**
+ * Pumps the socket one byte at a time, in blocks, without buffering the whole
+ * response.
+ *
+ * Each refill runs the network poll callback, which is why HTTPClient's own
+ * body readers (getString/writeToStream) can't be used here -- they block
+ * without giving the fetch task a chance to poll. That also means they can't
+ * de-chunk for us, so the wire image comes out raw and BodyFramer unwraps it.
+ *
+ * Where the body ends is BodyFramer's business, not this class's: it stops
+ * pulling at the right byte. Reading a little past that point into buffer_ is
+ * harmless while the connection is torn down after every fetch.
+ */
+class PollingSocketSource {
+ public:
+  PollingSocketSource(HTTPClient& http, WiFiClient& stream,
+                      unsigned long timeout_ms)
+      : http_(&http), stream_(&stream), started_ms_(millis()),
+        timeout_ms_(timeout_ms) {}
+
+  /** Next raw byte, or -1 once the socket closes or the deadline passes. */
+  int read() {
+    if (pos_ >= len_ && !refill()) {
+      return -1;
+    }
+    return static_cast<unsigned char>(buffer_[pos_++]);
+  }
+
+ private:
+  bool refill() {
+    pos_ = 0;
+    len_ = 0;
+    while (millis() - started_ms_ < timeout_ms_) {
+      pollNetwork();
+      const int available = stream_->available();
+      if (available > 0) {
+        const int to_read = available > static_cast<int>(sizeof(buffer_))
+                                ? static_cast<int>(sizeof(buffer_))
+                                : available;
+        const int read_bytes = stream_->readBytes(buffer_, to_read);
+        if (read_bytes > 0) {
+          len_ = static_cast<size_t>(read_bytes);
+          return true;
+        }
+      }
+      if (!http_->connected() && stream_->available() <= 0) {
+        break;  // server closed and the socket is drained
+      }
+      delay(1);
+    }
     return false;
   }
 
-  const int content_length = http.getSize();
-  (void)content_length;
-  payload.reserve(4096);
+  HTTPClient* http_;
+  WiFiClient* stream_;
+  unsigned long started_ms_;
+  unsigned long timeout_ms_;
+  char buffer_[512];
+  size_t pos_ = 0;
+  size_t len_ = 0;
+};
 
-  uint8_t buffer[512];
-  const unsigned long deadline = millis() + kRequestTimeoutMs;
-  while (millis() < deadline) {
-    pollNetwork();
-    const int available = stream->available();
-    if (available > 0) {
-      const int to_read =
-          available > static_cast<int>(sizeof(buffer)) ? static_cast<int>(sizeof(buffer))
-                                                       : available;
-      const int read_bytes = stream->readBytes(buffer, to_read);
-      if (read_bytes > 0) {
-        payload.concat(reinterpret_cast<const char*>(buffer),
-                       static_cast<unsigned>(read_bytes));
-      }
-    }
-    if (content_length > 0 &&
-        static_cast<int>(payload.length()) >= content_length) {
-      break;
-    }
-    if (!http.connected() && stream->available() <= 0) {
-      break;
-    }
-    delay(1);
-  }
-
-  return payload.length() > 0;
-}
+using BodyReader = services::http::BodyFramer<PollingSocketSource>;
 
 float kmToNauticalMiles(float km) { return km / kKmPerNm; }
 
@@ -277,6 +292,16 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   url += "/dist/";
   url += String(dist_nm, 1);
 
+  // Keep only the fields we render; the rest never reaches RAM.
+  JsonDocument filter;
+  JsonObject f = filter["ac"].add<JsonObject>();
+  for (const char* key :
+       {"lat", "lon", "true_heading", "mag_heading", "track", "dir", "gs",
+        "tas", "ias", "alt_baro", "alt_geom", "seen_pos", "flight", "hex", "t",
+        "category"}) {
+    f[key] = true;
+  }
+
   WiFiClientSecure client;
   client.setInsecure();
 
@@ -286,6 +311,11 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
     return false;
   }
 
+  // HTTPClient only records Transfer-Encoding in the collected headers when
+  // it is asked for up front; _transferEncoding itself is private.
+  static const char* kWantedHeaders[] = {"Transfer-Encoding"};
+  http.collectHeaders(kWantedHeaders, 1);
+
   http.setTimeout(kRequestTimeoutMs);
   const int code = performGetWithPoll(http);
   if (code != HTTP_CODE_OK) {
@@ -294,56 +324,75 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
     return false;
   }
 
-  String payload;
-  if (!readResponseBodyWithPoll(http, payload)) {
-    Serial.println("adsb: empty response");
+  WiFiClient* stream = http.getStreamPtr();
+  if (stream == nullptr) {
+    Serial.println("adsb: no response stream");
     http.end();
     return false;
   }
+
+  // On HTTP/1.1 the CDN answers with Transfer-Encoding: chunked, and
+  // getStreamPtr() hands back the raw socket -- chunk sizes and all. BodyFramer
+  // strips that framing back off.
+  const services::http::BodyFraming framing =
+      http.header("Transfer-Encoding").equalsIgnoreCase("chunked")
+          ? services::http::BodyFraming::kChunked
+          : services::http::BodyFraming::kIdentity;
+
+  PollingSocketSource source(http, *stream, kRequestTimeoutMs);
+  BodyReader body(source, framing, http.getSize());
+  JsonDocument doc;
+  const DeserializationError err =
+      deserializeJson(doc, body, DeserializationOption::Filter(filter));
+  // Read off the terminating chunk the parser stopped short of, so the socket
+  // sits at the end of the message. Not needed while every fetch builds its own
+  // connection, but a prerequisite for ever reusing one.
+  body.drain();
   http.end();
-
-  const size_t payload_len = payload.length();
-  size_t doc_capacity = payload_len * 2u;
-  if (doc_capacity < 24 * 1024) {
-    doc_capacity = 24 * 1024;
-  }
-  if (doc_capacity > 96 * 1024) {
-    doc_capacity = 96 * 1024;
-  }
-
-  DynamicJsonDocument doc(doc_capacity);
-  const DeserializationError err = deserializeJson(doc, payload);
-  if (err) {
-    Serial.printf("adsb: JSON parse error: %s (payload=%u bytes)\n",
-                  err.c_str(), static_cast<unsigned>(payload_len));
+  if (err || body.framingError() || body.truncated()) {
+    if (body.framingError()) {
+      Serial.println("adsb: malformed chunked body");
+    } else if (body.truncated()) {
+      Serial.println("adsb: truncated response");
+    } else if (body.bytesRead() == 0) {
+      Serial.println("adsb: empty response");
+    } else {
+      Serial.printf("adsb: JSON parse error: %s\n", err.c_str());
+    }
     return false;
   }
 
-  JsonArray ac = doc["ac"].as<JsonArray>();
-  if (ac.isNull()) {
-    replaceTracks(nullptr, 0, millis());
-    return true;
-  }
-
   size_t n = 0;
-  for (JsonObject plane : ac) {
-    if (n >= kMaxAircraft) {
-      break;
-    }
-    if (!plane["lat"].is<float>() || !plane["lon"].is<float>()) {
-      continue;
-    }
-    if (isOnGround(plane) && !config::kAdsbShowGroundAircraft) {
-      continue;
-    }
+  JsonArray ac = doc["ac"].as<JsonArray>();
+  if (!ac.isNull()) {
+    for (JsonObject plane : ac) {
+      if (n >= kMaxAircraft) {
+        break;
+      }
+      if (!plane["lat"].is<float>() || !plane["lon"].is<float>()) {
+        continue;
+      }
+      if (isOnGround(plane) && !config::kAdsbShowGroundAircraft) {
+        continue;
+      }
 
-    s_incoming[n].lat = plane["lat"].as<float>();
-    s_incoming[n].lon = plane["lon"].as<float>();
-    s_incoming[n].nose_deg = pickNoseHeading(plane);
-    s_incoming[n].track_deg = pickTrackHeading(plane);
-    s_incoming[n].gs_knots = pickGroundSpeed(plane);
-    fillTagFields(&s_incoming[n], plane);
-    ++n;
+      s_incoming[n].lat = plane["lat"].as<float>();
+      s_incoming[n].lon = plane["lon"].as<float>();
+      s_incoming[n].nose_deg = pickNoseHeading(plane);
+      s_incoming[n].track_deg = pickTrackHeading(plane);
+      s_incoming[n].gs_knots = pickGroundSpeed(plane);
+
+      // seen_pos: seconds since this position was measured. Use it as the
+      // dead-reckoning age offset, capped so a very stale fix isn't flung far.
+      float seen_pos = 0.0f;
+      readJsonFloat(plane, "seen_pos", &seen_pos);
+      if (seen_pos < 0.0f) seen_pos = 0.0f;
+      if (seen_pos > 30.0f) seen_pos = 30.0f;
+      s_incoming[n].pos_age_ms = static_cast<uint32_t>(seen_pos * 1000.0f);
+
+      fillTagFields(&s_incoming[n], plane);
+      ++n;
+    }
   }
 
   replaceTracks(s_incoming, n, millis());

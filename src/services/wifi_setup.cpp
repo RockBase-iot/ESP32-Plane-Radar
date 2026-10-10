@@ -4,6 +4,7 @@
 #include <WiFiManager.h>
 
 #include <cstdio>
+#include <cstring>
 
 #include <Preferences.h>
 #include <esp_system.h>
@@ -130,7 +131,7 @@ char s_sweep_checkbox_attrs[32] = "type=\"checkbox\" checked";
 WiFiManagerParameter s_param_sweep("show_sweep", "Show radar sweep", "T", 2,
                                    s_sweep_checkbox_attrs, WFM_LABEL_AFTER);
 
-void refreshPortalParamDefaults() {
+void refreshPortalParamValues() {
   char lat_buf[kCoordParamLen + 1];
   char lon_buf[kCoordParamLen + 1];
   snprintf(lat_buf, sizeof(lat_buf), "%.6f", services::location::lat());
@@ -170,11 +171,11 @@ void onPortalParamsSaved() {
   ui::radar::saveMilesFromPortal(s_param_miles.getValue());
   ui::radar::saveRunwaysFromPortal(s_param_runways.getValue());
   ui::radar::saveSweepFromPortal(s_param_sweep.getValue());
-  refreshPortalParamDefaults();
+  refreshPortalParamValues();
 }
 
 void attachPortalParams(WiFiManager& wm) {
-  refreshPortalParamDefaults();
+  refreshPortalParamValues();
   wm.addParameter(&s_param_city_selector);
   wm.addParameter(&s_param_lat);
   wm.addParameter(&s_param_lon);
@@ -316,7 +317,7 @@ void startLanWebPortal() {
       s_wm.getConfigPortalActive()) {
     return;
   }
-  refreshPortalParamDefaults();
+  refreshPortalParamValues();
   WiFi.mode(WIFI_STA);
   s_wm.setConfigPortalBlocking(false);
 #ifdef WM_MDNS
@@ -401,16 +402,35 @@ bool tryConnectWithUi(const String& ssid, const String& pass, bool show_ui) {
 }
 
 bool connectSavedNetwork(bool show_ui) {
-  if (!storedWifiCredentials()) {
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  if (esp_wifi_get_mode(&mode) != ESP_OK || mode == WIFI_MODE_NULL) {
+    WiFi.mode(WIFI_STA);
+    delay(50);
+  }
+
+  wifi_config_t conf = {};
+  if (esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) {
     return false;
   }
 
-  ensureWifiManager();
-  const String ssid = s_wm.getWiFiSSID();
-  if (ssid.length() == 0) {
+  if (conf.sta.ssid[0] == '\0') {
     return false;
   }
-  const String pass = s_wm.getWiFiPass();
+
+  // ESP-IDF stores the SSID in a fixed 32-byte field. A maximum-length
+  // SSID has no room for a trailing NUL, so copy it to a larger buffer
+  // and explicitly terminate it before constructing an Arduino String.
+  char ssid_buf[sizeof(conf.sta.ssid) + 1] = {};
+  memcpy(ssid_buf, conf.sta.ssid, sizeof(conf.sta.ssid));
+  ssid_buf[sizeof(conf.sta.ssid)] = '\0';
+
+  char pass_buf[sizeof(conf.sta.password) + 1] = {};
+  memcpy(pass_buf, conf.sta.password, sizeof(conf.sta.password));
+  pass_buf[sizeof(conf.sta.password)] = '\0';
+
+  const String ssid(ssid_buf);
+  const String pass(pass_buf);
+
   return tryConnectWithUi(ssid, pass, show_ui);
 }
 
@@ -420,7 +440,7 @@ bool openConfigPortal() {
   WiFi.mode(WIFI_OFF);
   delay(50);
   statusScreenPortal();
-  refreshPortalParamDefaults();
+  refreshPortalParamValues();
   s_wm.setConfigPortalBlocking(false);
   s_wm.startConfigPortal(config::kPortalApName);
   logPortalLifecycle("setup portal requested");

@@ -89,7 +89,10 @@ constexpr Position predictPosition(const Aircraft& aircraft,
     return {aircraft.lat, aircraft.lon};
   }
 
-  const float distance_m = predictedDistanceMeters(aircraft.gs_knots, elapsed_ms);
+  const unsigned long position_age_ms =
+      predictionElapsedMs(elapsed_ms) + aircraft.pos_age_ms;
+  const float distance_m =
+      predictedDistanceMeters(aircraft.gs_knots, position_age_ms);
   const MotionVector direction = trackUnitVector(aircraft.track_deg);
   const float north_m = distance_m * direction.north;
   const float east_m = distance_m * direction.east;
@@ -117,7 +120,7 @@ constexpr Position displayPosition(const AircraftTrack& track,
 
 constexpr AircraftTrack makeInitialTrack(const Aircraft& aircraft,
                                          unsigned long now_ms) {
-  return {aircraft, {aircraft.lat, aircraft.lon}, now_ms};
+  return {aircraft, predictPosition(aircraft, 0), now_ms};
 }
 
 constexpr AircraftTrack updateTrack(const AircraftTrack& previous,
