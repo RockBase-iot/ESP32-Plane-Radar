@@ -1,5 +1,6 @@
 #include "ui/radar_display.h"
 
+#include <Arduino.h>
 #include <lgfx/v1/lgfx_fonts.hpp>
 
 #include <algorithm>
@@ -82,16 +83,6 @@ constexpr uint8_t kFrameTimingSampleCount = 20;
 unsigned long s_frame_total_ms = 0;
 unsigned long s_frame_max_ms = 0;
 uint8_t s_frame_timing_samples = 0;
-bool s_has_data_update = false;
-unsigned long s_last_data_update_ms = 0;
-uint16_t s_corner_green = 0;
-uint16_t s_corner_amber = 0;
-uint16_t s_corner_cyan = 0;
-uint16_t s_corner_red = 0;
-uint16_t s_corner_muted = 0;
-#endif
-
-#ifdef BOARD_NM_TV_154
 bool s_has_data_update = false;
 unsigned long s_last_data_update_ms = 0;
 uint16_t s_corner_green = 0;
@@ -299,11 +290,16 @@ void initPalette() {
 }
 
 constexpr float kKmPerDeg = 111.0f;
+constexpr float kDegToRad = 3.14159265f / 180.0f;
 
 void offsetKmFromCenter(float lat, float lon, float* dx_km, float* dy_km,
                         float* dist_km) {
-  *dx_km =
-      static_cast<float>(lon - services::location::lon()) * kKmPerDeg;
+  // Longitude degrees shrink toward the poles; scale by cos(latitude) so
+  // east-west distance isn't overstated away from the equator.
+  const float center_lat_rad =
+      static_cast<float>(services::location::lat()) * kDegToRad;
+  *dx_km = static_cast<float>(lon - services::location::lon()) * kKmPerDeg *
+           cosf(center_lat_rad);
   *dy_km =
       static_cast<float>(lat - services::location::lat()) * kKmPerDeg;
   *dist_km = sqrtf((*dx_km) * (*dx_km) + (*dy_km) * (*dy_km));
@@ -691,12 +687,12 @@ void sortBeyondDotsFarFirst(BeyondDotDrawItem* items, size_t count) {
   }
 }
 
-void drawAircraft(unsigned long now_ms) {
+void drawAircraft() {
   initLabelMetrics();
 
   size_t n = 0;
   const services::adsb::Aircraft* planes =
-      services::adsb::aircraftList(now_ms, &n);
+      services::adsb::aircraftList(&n);
 
   AircraftDrawItem items[services::adsb::kMaxAircraft];
   BeyondDotDrawItem dots[services::adsb::kMaxAircraft];
@@ -1056,7 +1052,7 @@ void renderFrame(unsigned long now_ms) {
     const DrawScope scope(s_frame);
     drawSweep(now_ms);
     drawCornerTelemetry();
-    drawAircraft(now_ms);
+    drawAircraft();
   }
   s_frame.pushSprite(0, 0);
   tft.setTextDatum(textdatum_t::top_left);
@@ -1081,7 +1077,7 @@ void radarDisplayDraw() {
   drawStaticGrid(tft);
   drawSweep(now_ms);
   drawCornerTelemetry();
-  drawAircraft(now_ms);
+  drawAircraft();
   tft.setTextDatum(textdatum_t::top_left);
 }
 

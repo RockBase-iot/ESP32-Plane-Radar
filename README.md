@@ -15,7 +15,15 @@ The RockBase IoT Team adds support for **NM-TV-154**: **ESP32** + **1.54″ squa
 1. **Wi‑Fi setup** (if needed) — captive portal on AP **`PlaneRadar-Setup`**
 2. **Radar** — live aircraft from [adsb.fi](https://opendata.adsb.fi/) on a sonar-style grid
 
-After Wi‑Fi is saved, the device reconnects automatically; the radar runs in the main loop with periodic ADS-B updates (~5 s).
+After Wi‑Fi is saved, the device reconnects automatically; the radar runs in the main loop while a background task fetches ADS-B updates (a 5 s pause after each request).
+
+### Upstream v1.1.5 integration
+
+- HTTP/1.1 chunked responses are decoded and stream-parsed with an ArduinoJson field filter, without buffering the entire response.
+- Both board targets fetch in the background; Wi‑Fi portal handling, touch/BOOT controls, radar sweep and smoothed aircraft rendering stay in the main loop. Position estimates account for the feed's `seen_pos` age and retain the local prediction limit.
+- Radar framebuffers use RGB332 (8-bit) on both boards: 57,600 bytes of pixel storage instead of 115,200 bytes for RGB565. Color fidelity is reduced; resolution is unchanged.
+- Portal fields reflect accepted settings after saving, including the fork's city presets, timezone, clock and sweep options.
+- NM-TV-154 hardware support and the fork's `v1.2.0` version identifier are retained. The merge also includes upstream latitude-aware longitude scaling and the saved 32-byte Wi‑Fi SSID fix.
 
 ## Controls (BOOT, GPIO 9, active LOW)
 
@@ -102,7 +110,7 @@ As range decreases (or aircraft approach), targets move inward; beyond-ring dots
 
 - Source: `https://opendata.adsb.fi/api/v3/`
 - Fetch radius: `ui::radar::fetchRadiusKm()` — scales with the active preset to roughly the screen edge (so rim dots have data)
-- Poll interval: `kAdsbFetchIntervalMs` (5 s) in `config.h`
+- Background fetch pause: `kAdsbFetchIntervalMs` (5 s) in `config.h`; request time adds to the update interval
 - Ground aircraft hidden by default (`kAdsbShowGroundAircraft`)
 
 ## Configuration
